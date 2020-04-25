@@ -3,11 +3,6 @@
 // Seth Pugsley, seth.h.pugsley@intel.com
 //
 
-/*
-
-  This file does NOT implement any prefetcher, and is just an outline
-
- */
 
 #include <stdio.h>
 #include "./inc/prefetcher.h"
@@ -57,7 +52,6 @@ void l2_prefetcher_operate(int cpu_num, unsigned long long int addr, unsigned lo
 	// update index and global history tables
 	if(!cache_hit) {
 		if(ghb[it[ip % IT_SIZE].prev].pc == ip) {
-			printf("%lld\n", ip);
 			ghb[curr_idx].prev = it[ip % IT_SIZE].prev;
 		} else {
 			ghb[curr_idx].prev = curr_idx; // break the pc linked list if ips do not match anymore (by pointing to itself)
@@ -73,13 +67,14 @@ void l2_prefetcher_operate(int cpu_num, unsigned long long int addr, unsigned lo
 		long long int delta2 = 0;
 		long long int delta = 0;
 		unsigned int cnt = 0;
-		while(ghb[elem_idx].prev != elem_idx &&/* ghb[elem_idx].pc == ip &&*/ state != FOUND_MATCH && cnt < GHB_SIZE) {
+		while(ghb[elem_idx].prev != elem_idx && ghb[elem_idx].pc == ip && state != FOUND_MATCH && cnt < GHB_SIZE) {
 //			printf("%d\n", ghb[elem_idx].prev);
 //			printf("current index: %d\n", curr_idx);
 			switch(state) {
 				case DELTA1:
 //					printf("case DELTA1\n");
 					delta1 = delta1 - ghb[elem_idx].addr;
+//					if(delta1 > 35000) return;
 					delta2 = ghb[elem_idx].addr;
 					state = DELTA2;
 					elem_idx = ghb[elem_idx].prev;
@@ -87,6 +82,8 @@ void l2_prefetcher_operate(int cpu_num, unsigned long long int addr, unsigned lo
 				case DELTA2:
 //					printf("case DELTA2\n");
 					delta2 = delta2 - ghb[elem_idx].addr;
+//					if(delta2 > 35000) return;
+//					if(delta1 + delta2 > 3500) return;
 					state = COND1;
 					delta = ghb[elem_idx].addr;
 					elem_idx = ghb[elem_idx].prev;
@@ -105,11 +102,34 @@ void l2_prefetcher_operate(int cpu_num, unsigned long long int addr, unsigned lo
 //					printf("delta1: %lld\n", delta1);
 					break;
 				case COND2:
-					printf("case COND2\n");
+//					printf("case COND2\n");
 					delta = delta - ghb[elem_idx].addr;
 					if(delta == delta2) {
 //						printf("found match");
-						printf("delta1: %lld  delta2: %lld  delta: %lld\n", delta1, delta2, delta);
+
+						unsigned long long int lower;
+						unsigned long long int upper;
+						unsigned long long int high_delta;
+						unsigned long long int low_delta;
+						if(delta1 > delta2) {
+							high_delta = delta1;
+							low_delta = delta2;
+						} else {
+							high_delta = delta2;
+							low_delta = delta1;
+						}
+						lower = (low_delta < 0) ? addr + low_delta: addr;
+						upper = (high_delta > 0) ? addr + high_delta : addr;
+
+						int out = 0;
+						if(get_l2_mshr_occupancy(0) < 8) {
+						  out = l2_prefetch_line(0, lower, upper, FILL_LLC);
+						} else {
+						  out = l2_prefetch_line(0, lower, upper, FILL_L2);
+						}
+//						printf("%s\n", out ? "successfull\0" : "not successfull\0");
+
+//						printf("delta1: %lld  delta2: %lld  delta: %lld\n", delta1, delta2, delta);
 						state = FOUND_MATCH;
 						elem_idx = ghb[elem_idx].prev;
 					} else {
