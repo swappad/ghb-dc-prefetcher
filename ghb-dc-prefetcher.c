@@ -6,10 +6,19 @@
 
 #include <stdio.h>
 #include "./inc/prefetcher.h"
-#include <stdlib.h>
 
-#define GHB_SIZE 512
-#define IT_SIZE 512
+#define GHB_SIZE 1024
+#define IT_SIZE 256
+#define DELTA_RANGE 6000
+
+// Implementation Variants:
+// these three must be used mutually
+//#define ACCURATE_PREFETCH
+#define SEMI_ACCURATE_PREFETCH
+//#define PRIMITIVE_PREFETCH
+
+//#define CHECK_BOUNDS
+
 
 typedef struct {
 	unsigned long long int pc;
@@ -38,35 +47,53 @@ typedef enum {
 } STATE;
 
 
+void print_ghb() {
+	printf("IT: \n");
+	for(int i=0; i < IT_SIZE; i++) {
+		printf("prev: %d\n",it[i].prev);
+	}
+	for(int i=0; i < GHB_SIZE; i++) {
+		printf("i: %d, pc: %lld, prev: %d, addr: %lld, delta1: %lld\n", i, ghb[i].pc, ghb[i].prev, ghb[i].addr, ghb[i].addr - ghb[ghb[i].prev].addr);
+	}
+}
 
 void l2_prefetcher_initialize(int cpu_num)
 {
 
-  printf("No Prefetching\n");
+  printf("GHB PC/DC prefetching\n");
   // you can inspect these knob values from your code to see which configuration you're runnig in
   printf("Knobs visible from prefetcher: %d %d %d\n", knob_scramble_loads, knob_small_llc, knob_low_bandwidth);
 }
 
+float no_match = 0.0f;
+float match = 0.0f;
+float cache_access = 0;
+float cache_miss = 0;
 void l2_prefetcher_operate(int cpu_num, unsigned long long int addr, unsigned long long int ip, int cache_hit) {
+	cache_access += 1.0;
 
-	// update index and global history tables
 	if(!cache_hit) {
+		cache_miss+= 1.0;
+
+		// update index and global history tables on cache miss
 		if(ghb[it[ip % IT_SIZE].prev].pc == ip) {
 			ghb[curr_idx].prev = it[ip % IT_SIZE].prev;
 		} else {
-			ghb[curr_idx].prev = curr_idx; // break the pc linked list if ips do not match anymore (by pointing to itself)
+			ghb[curr_idx].prev = curr_idx; // break the pc linked list if ip does not match anymore (by pointing to itself)
 		}
 		ghb[curr_idx].addr = addr;
 		ghb[curr_idx].pc = ip;
 		it[ip % IT_SIZE].prev = curr_idx;
-		// check for prefetching candidates 
 
+		// check for prefetching candidates 
 		unsigned int elem_idx = ghb[curr_idx].prev;
 		STATE state = DELTA1;
 		long long int delta1 = ghb[curr_idx].addr;
 		long long int delta2 = 0;
 		long long int delta = 0;
-		unsigned int cnt = 0;
+		unsigned int cnt = 0; // counter avoids infinite search loop
+
+
 		while(ghb[elem_idx].prev != elem_idx && ghb[elem_idx].pc == ip && state != FOUND_MATCH && cnt < GHB_SIZE) {
 //			printf("%d\n", ghb[elem_idx].prev);
 //			printf("current index: %d\n", curr_idx);
@@ -74,7 +101,6 @@ void l2_prefetcher_operate(int cpu_num, unsigned long long int addr, unsigned lo
 				case DELTA1:
 //					printf("case DELTA1\n");
 					delta1 = delta1 - ghb[elem_idx].addr;
-//					if(delta1 > 35000) return;
 					delta2 = ghb[elem_idx].addr;
 					state = DELTA2;
 					elem_idx = ghb[elem_idx].prev;
@@ -82,8 +108,6 @@ void l2_prefetcher_operate(int cpu_num, unsigned long long int addr, unsigned lo
 				case DELTA2:
 //					printf("case DELTA2\n");
 					delta2 = delta2 - ghb[elem_idx].addr;
-//					if(delta2 > 35000) return;
-//					if(delta1 + delta2 > 3500) return;
 					state = COND1;
 					delta = ghb[elem_idx].addr;
 					elem_idx = ghb[elem_idx].prev;
@@ -100,6 +124,9 @@ void l2_prefetcher_operate(int cpu_num, unsigned long long int addr, unsigned lo
 					elem_idx = ghb[elem_idx].prev;
 //					printf("delta: %lld\n", delta);
 //					printf("delta1: %lld\n", delta1);
+					if(cnt >= GHB_SIZE) {
+						no_match += 1.0;
+					}
 					break;
 				case COND2:
 //					printf("case COND2\n");
@@ -111,7 +138,21 @@ void l2_prefetcher_operate(int cpu_num, unsigned long long int addr, unsigned lo
 						unsigned long long int upper;
 						unsigned long long int high_delta;
 						unsigned long long int low_delta;
-						if(delta1 > delta2) {
+#ifdef CHECK_BOUNDS
+						if((delta1 > DELTA_RANGE || delta1 < -DELTA_RANGE) && (delta2 > DELTA_RANGE || delta2 < -DELTA_RANGE)) return;
+						if(delta2 > DELTA_RANGE || delta2 < -DELTA_RANGE) {
+							delta2 = 0;
+						}
+						if(delta1 > DELTA_RANGE|| delta1 < -DELTA_RANGE) {
+							addr = addr + delta1;
+							delta1 = 0;
+						}
+#endif
+
+						int out = 0;
+
+#ifdef SEMI_ACCURATE_PREFETCH
+						if(delta1 >= delta2) {
 							high_delta = delta1;
 							low_delta = delta2;
 						} else {
@@ -120,21 +161,58 @@ void l2_prefetcher_operate(int cpu_num, unsigned long long int addr, unsigned lo
 						}
 						lower = (low_delta < 0) ? addr + low_delta: addr;
 						upper = (high_delta > 0) ? addr + high_delta : addr;
+						out = l2_prefetch_line(0, lower, upper, FILL_L2);
+#endif
+#ifdef ACCURATE_PREFETCH
 
-						int out = 0;
-						if(get_l2_mshr_occupancy(0) < 8) {
-						  out = l2_prefetch_line(0, lower, upper, FILL_LLC);
-						} else {
-						  out = l2_prefetch_line(0, lower, upper, FILL_L2);
+						if(delta1 < 0 && delta1+delta2 < 0) {
+							upper = addr;
 						}
+						if(delta1 >=0 && delta2 < 0) {
+							upper = addr + delta1;
+						}
+						if(delta2 >=0 && delta1+delta2 > 0) {
+							upper = addr+delta1+delta2;
+						}
+						if(delta1 >= 0 && delta1+delta2 >=0) {
+							lower = addr;
+						}
+						if(delta1 < 0 && delta2 >= 0) {
+							lower = addr+delta1;
+						}
+						if(delta2 < 0 && delta1+delta2 < 0) {
+							lower = addr+delta1+delta2;
+						}
+						
+						if(get_l2out = _mshr_occupancy(0) > 8) {
+							out = // conservatively prefetch into the LLC, because MSHRs are scarce
+							out = l2_prefetch_line(0, lower, upper, FILL_LLC);
+						} else {
+							// MSHRs not too busy, so prefetch into L2
+							out = l2_prefetch_line(0, lower, upper, FILL_L2);
+						}
+
+						//out = l2_prefetch_line(0, lower, upper, FILL_L2);
+#endif
+
+//						printf("lower: %lld, target addr: %lld\n", lower, ghb[elem_idx].addr);
+//						printf("upper: %lld, miss addr: %lld\n", upper, addr);
+
+#ifdef PRIMITIVE_PREFETCH
+						  out = l2_prefetch_line(0, addr, addr + delta1, FILL_L2);
+#endif
+
 //						printf("%s\n", out ? "successfull\0" : "not successfull\0");
 
-//						printf("delta1: %lld  delta2: %lld  delta: %lld\n", delta1, delta2, delta);
+//						if(!out) printf("delta1: %lld  delta2: %lld  delta: %lld\n\n", delta1, delta2, delta);
 						state = FOUND_MATCH;
+						match+=1.0;
+						//printf("match at pos: %d\n", cnt);
 						elem_idx = ghb[elem_idx].prev;
 					} else {
 						state = COND1;
 						delta = ghb[elem_idx].addr;
+
 					}
 					break;
 				default: 
@@ -143,19 +221,11 @@ void l2_prefetcher_operate(int cpu_num, unsigned long long int addr, unsigned lo
 			}
 
 		}
+		// circular buffer pointer
 		curr_idx = (curr_idx + 1) % GHB_SIZE;
+//		print_ghb();
 
 	}
-	/*
-	char sign = (delta < 0);
-	long long int old_delta = delta;
-	delta = sign ? (~delta + 1) : delta;
-	if(delta < IT_SIZE) {
-		printf("%lld -> %lld\n",old_delta, (delta  ^ sign) % IT_SIZE);
-	}
-	// printf("%lld -> %lld\n",old_delta, (delta  ^ sign) % IT_SIZE);
-	prev_addr = addr;
-	*/
   // uncomment this line to see all the information available to make prefetch decisions
   // printf("(0x%llx 0x%llx %d %d %d) ", addr, ip, cache_hit, get_l2_read_queue_occupancy(0), get_l2_mshr_occupancy(0));
 }
@@ -179,5 +249,7 @@ void l2_prefetcher_warmup_stats(int cpu_num)
 
 void l2_prefetcher_final_stats(int cpu_num)
 {
-  printf("Prefetcher final stats\n");
+	printf("match/no match: %.3f\n", (match/no_match));
+	printf("miss rate: %0.3f\n", cache_miss/cache_access);
+	printf("Prefetcher final stats\n");
 }
